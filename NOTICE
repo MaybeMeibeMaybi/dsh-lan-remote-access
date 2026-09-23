@@ -1,0 +1,33 @@
+# NOTICE
+
+## Authorship
+
+All source code in this repository (the entry proxy, the dsh startup plugin, and the
+Windows launcher) was written for this project by **Jim Chen** and is licensed under the
+MIT License — see [`LICENSE`](LICENSE).
+
+## Prior art and related projects
+
+The design of this repository was informed by work done in a sibling project of ours,
+[`dsh-harmonyos-hiboard`](https://github.com/MaybeMeibeMaybi/dsh-harmonyos-hiboard), which in
+turn is based on [Entity-Him/dsh-hiboard-push](https://github.com/Entity-Him/dsh-hiboard-push)
+(MIT). Two patterns were carried over from there:
+
+1. **Starting a helper process from a dsh profile plugin** (`ctx.effect` + `spawn` with
+   `detached` + `unref`, health-probe before spawning) rather than from an external
+   launcher or scheduled task. The sibling project uses it to start a reverse proxy; this
+   project uses the same pattern for the LAN entry proxy.
+
+2. **The Windows script-encoding rules** documented in `docs/DEPLOY.md`: `.cmd`/`.bat` must
+   be ASCII-only (cmd.exe decodes them with the system ANSI code page, so UTF-8 text becomes
+   mojibake and eats the leading `REM`), and a `.ps1` containing non-ASCII must carry a
+   UTF-8 BOM (PowerShell 5.1 decodes it as ANSI otherwise). These were learned the hard way
+   and are recorded so that nobody has to rediscover them.
+
+No third-party source files are vendored in this repository.
+
+## Runtime dependencies
+
+- Node.js 18+ (built-in modules only: `node:http`, `node:os`)
+- DeepSeek Harness (dsh) with cordis 4, for the plugin
+- `@deepseek-ai/schemastery`, for the plugin's config schema (peer dependency)

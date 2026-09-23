@@ -1,0 +1,43 @@
+{
+  "name": "dsh-lan-remote-access",
+  "version": "1.0.0",
+  "description": "Reach the DeepSeek Harness (dsh) web GUI from any device on your LAN. A loopback-only dsh server plus a local entry proxy that tunnels HTTP and WebSocket, with a launcher that never starts a second instance.",
+  "author": "Jim Chen",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MaybeMeibeMaybi/dsh-lan-remote-access.git"
+  },
+  "bugs": {
+    "url": "https://github.com/MaybeMeibeMaybi/dsh-lan-remote-access/issues"
+  },
+  "homepage": "https://github.com/MaybeMeibeMaybi/dsh-lan-remote-access#readme",
+  "type": "module",
+  "main": "src/plugin/lib/index.js",
+  "exports": {
+    ".": "./src/plugin/lib/index.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "src",
+    "docs",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "lan",
+    "reverse-proxy",
+    "websocket",
+    "loopback",
+    "remote-access",
+    "localhost",
+    "cordis"
+  ],
+  "peerDependencies": {
+    "@deepseek-ai/cordis": ">=4.0.0-rc.1 <5.0.0-0",
+    "@deepseek-ai/schemastery": ">=3.0.0-rc.1 <4.0.0-0"
+  }
+}

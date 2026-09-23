@@ -1,0 +1,12 @@
+{
+  "name": "dsh-entry-startup",
+  "version": "0.2.0",
+  "private": true,
+  "description": "随 dsh 启动本地入口代理（局域网 3081 + 公网中继 18080），让手机能从同 WiFi 或公网访问 dsh web。",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": { ".": "./lib/index.js", "./package.json": "./package.json" },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": ">=4.0.0-rc.1 <5.0.0-0"
+  }
+}
