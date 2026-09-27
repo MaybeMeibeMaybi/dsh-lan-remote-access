@@ -215,6 +215,13 @@ function createEntryServer() {
 	const server = http.createServer(handleRequest);
 	server.on("upgrade", handleUpgrade);
 	server.on("clientError", handleClientError);
+	// 连接级错误必须兜住：有些客户端建连后、在发出任何请求之前就被重置
+	// （NAT 超时、手机切网、扫描器探测）。这类 socket 不会进入 req/res 处理器，
+	// 少了这个处理器，一个 ECONNRESET 就能把整个入口进程打崩。
+	// 2026-09-27 实测：3081 代理就是这样静默消失的（日志 `read ECONNRESET / TCP.onStreamRead`）。
+	server.on("connection", (socket) => {
+		socket.on("error", () => {});
+	});
 	// 启动插件在每次 dsh 启动时都会尝试拉起本代理，抢占失败必须安静退出而不是抛错。
 	// 只有"一个都没绑上"时才算另一个实例在服务；附加地址（tailnet）失败只记录不退出，
 	// 否则 Tailscale 网卡抖动会连带把局域网入口打掉。
@@ -281,6 +288,15 @@ function reconcile() {
 		LAN_IP = desired[0];
 	}
 }
+
+// 顶层兜底：入口代理同时承载局域网与 tailnet 两条路，进程"活着"比"干净退出"重要得多。
+// 任何漏网的未处理异常都不应该让手机彻底失联（2026-09-27 因为一个 ECONNRESET 消失过一次）。
+process.on("uncaughtException", (error) => {
+	console.error(`entry-proxy: uncaughtException（已兜住，进程继续）：${error?.message ?? String(error)}`);
+});
+process.on("unhandledRejection", (reason) => {
+	console.error(`entry-proxy: unhandledRejection（已兜住）：${reason?.message ?? String(reason)}`);
+});
 
 reconcile();
 if (FOLLOW_LAN) {
