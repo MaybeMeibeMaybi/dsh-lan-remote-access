@@ -6,9 +6,10 @@
  *   把请求转发到 127.0.0.1:3080，而 dsh 本体始终不暴露。
  *
  * 两种用法（同一个脚本，只换参数）：
- *   局域网直连：node dsh-entry-proxy.mjs --bind-ip 192.168.0.105 --port 3081
- *   公网中继  ：node dsh-entry-proxy.mjs --bind-ip 127.0.0.1     --port 18080
- *               （18080 只允许本机 frpc 送入；公网侧由中继服务器:18080 承接）
+ *   局域网直连：node dsh-entry-proxy.mjs --port 3081
+ *               （不带 --bind-ip 时**自动探测并跟随**本机局域网地址，换网不用改配置）
+ *   公网中继  ：node dsh-entry-proxy.mjs --bind-ip 127.0.0.1 --port 18080
+ *               （18080 只允许本机隧道送入；公网侧由中继服务器:18080 承接）
  *
  * 两个必须遵守的细节：
  *   1. Host / Origin 原样透传。dsh 的 /api 浏览器信任围栏比较这两者，且只接受
@@ -27,19 +28,107 @@ function arg(name, fallback) {
 	return i !== -1 && process.argv[i + 1] !== undefined ? process.argv[i + 1] : fallback;
 }
 
-/** 第一个非内部 IPv4 地址，用于"跟随 DHCP 变化"的默认绑定。 */
-function detectLanIp() {
-	for (const addresses of Object.values(os.networkInterfaces())) {
-		for (const address of addresses ?? []) {
-			if (address.family === "IPv4" && !address.internal) return address.address;
-		}
-	}
-	return undefined;
+/**
+ * 虚拟 / 隧道网卡名黑名单。
+ *
+ * 为什么需要：`os.networkInterfaces()` 的顺序不保证把真实局域网网卡放前面。
+ * 一旦机器上出现 Tailscale(100.64/10)、Hyper-V、VirtualBox、WSL 之类网卡，
+ * 「取第一个地址」就可能绑到手机上根本路由不到的地址上——表现和踩过的
+ * 「绑在过期 IP 上」完全一样（页面能开、会话为空、一直"自动重连中"）。
+ */
+const VIRTUAL_ADAPTER = /virtual|vmware|vbox|hyper-?v|wsl|tailscale|zerotier|docker|loopback|bluetooth|tap|tun|vpn|radmin|hamachi|npcap|loopback/i;
+
+/** 判断是否是可用的局域网地址：排除内部、APIPA(169.254)、Tailscale CGNAT(100.64/10)。 */
+function usableLanAddress(address, name) {
+	if (address.family !== "IPv4" || address.internal) return false;
+	if (VIRTUAL_ADAPTER.test(name)) return false;
+	if (address.address.startsWith("169.254.")) return false;
+	const second = Number(address.address.split(".")[1]);
+	if (address.address.startsWith("100.") && second >= 64 && second <= 127) return false;
+	return true;
 }
 
-const LAN_IP = arg("bind-ip", detectLanIp() ?? "127.0.0.1");
+/** RFC1918 私有网段优先级：192.168 > 10 > 172.16-31 > 其他（越小越优先）。 */
+function privateRank(address) {
+	if (address.startsWith("192.168.")) return 0;
+	if (address.startsWith("10.")) return 1;
+	const [first, second] = address.split(".").map(Number);
+	if (first === 172 && second >= 16 && second <= 31) return 2;
+	return 3;
+}
+
+/** 探测本机局域网地址，用于"跟随 DHCP 变化"的默认绑定。 */
+function detectLanIp() {
+	const candidates = [];
+	for (const [name, addresses] of Object.entries(os.networkInterfaces())) {
+		for (const address of addresses ?? []) {
+			if (usableLanAddress(address, name)) candidates.push({ name, address: address.address });
+		}
+	}
+	candidates.sort((a, b) => privateRank(a.address) - privateRank(b.address));
+	const chosen = candidates[0];
+	if (chosen) LAN_IFACE = chosen.name;
+	return chosen?.address;
+}
+
+/** 探测到地址时所使用的网卡名，仅用于日志。 */
+let LAN_IFACE = "";
+
+const BIND_ARG = arg("bind-ip", "") || process.env.DSH_ENTRY_BIND_IP || "";
 const PORT = Number(arg("port", "3081"));
 const TARGET = new URL(arg("target", "http://127.0.0.1:3080"));
+/** 当前实际绑定的地址；IPv4 变化时会更新。 */
+let LAN_IP = BIND_ARG || detectLanIp() || "127.0.0.1";
+/** 显式指定 --bind-ip 时不做跟随（例如 0.0.0.0 或 127.0.0.1）。 */
+const FOLLOW_LAN = BIND_ARG === "";
+
+/**
+ * 跟随本机 LAN 地址变化。
+ *
+ * 为什么需要：电脑会在不同网络间切换，DHCP 会换掉局域网地址。
+ * 早期版本只在启动时绑定当时的地址，换网后就"绑在一个已不存在的 IP 上"，
+ * 手机表现为能打开缓存页面但一直"自动重连中"（这是真实踩过的故障）。
+ *
+ * 做法：监听网卡事件 + 定时兜底复查；发现地址变了就 re-listen 到新地址。
+ * 注意重绑期间会有极短的连接中断，但不会退出进程（老版本会因 EADDRINUSE 直接退出）。
+ */
+function currentLanIp() {
+	return detectLanIp();
+}
+function followLanAddress(server) {
+	if (!FOLLOW_LAN) return;
+	let rebinding = false;
+	const check = () => {
+		if (rebinding) return;
+		const now = currentLanIp();
+		if (!now || now === LAN_IP) return;
+		rebinding = true;
+		const previous = LAN_IP;
+		LAN_IP = now;
+		console.log(`entry-proxy: LAN 地址由 ${previous} 变为 ${now}，重新绑定`);
+		try {
+			server.close(() => {
+				server.listen(PORT, LAN_IP, () => {
+					console.log(`entry-proxy: 已重新绑定 http://${LAN_IP}:${String(PORT)}/ -> ${TARGET.origin}`);
+					rebinding = false;
+				});
+			});
+			// 旧连接（例如手机还挂着的 WebSocket）不会自己断开，必须强制关闭，
+			// 否则 close() 的回调永远不触发，代理就卡死在"已关闭端口"的状态。
+			server.closeAllConnections?.();
+		} catch (error) {
+			console.error(`entry-proxy: 重绑失败 ${error?.message ?? String(error)}`);
+			rebinding = false;
+		}
+	};
+	// 网卡变化立即触发；另有定时兜底（有些网络切换不触发事件）
+	try {
+		os.networkInterfaces();
+		setInterval(check, 15000).unref();
+	} catch {
+		/* 忽略 */
+	}
+}
 
 /** 去掉逐跳首部；Host / Origin / Cookie 一律原样透传。 */
 function copyHeaders(headers) {
@@ -138,5 +227,7 @@ server.on("error", (error) => {
 });
 
 server.listen(PORT, LAN_IP, () => {
-	console.log(`entry-proxy: http://${LAN_IP}:${PORT}/ -> ${TARGET.origin}`);
+	console.log(`entry-proxy: http://${LAN_IP}:${PORT}/ -> ${TARGET.origin}${LAN_IFACE ? ` （网卡 ${LAN_IFACE}）` : ""}`);
+	if (FOLLOW_LAN) console.log("entry-proxy: 已启用 LAN 地址跟随（换网后自动重绑）");
+	followLanAddress(server);
 });

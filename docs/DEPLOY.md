@@ -59,7 +59,7 @@ dsh plugin --profile web add "file:E:/dsh-vendor/dsh-entry-startup"
 - id: web-runtime
   config:
     trustedHosts:
-      - <电脑的LAN地址>          # 例：192.168.0.105
+      - <电脑的LAN地址>          # 例：192.168.0.x（换成你自己那份 DHCP 地址）
 - id: connection
   config:
     trustedHosts:
