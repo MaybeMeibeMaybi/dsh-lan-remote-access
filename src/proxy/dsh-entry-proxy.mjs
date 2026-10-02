@@ -118,6 +118,49 @@ const FOLLOW_LAN = BIND_ARG === "";
 /** 已建立的监听：地址 -> http.Server。同一份请求逻辑可以挂在多个地址上。 */
 const listeners = new Map();
 
+/**
+ * token 过期/缺失时的说明页（替换 dsh 那句含糊的英文）。
+ *
+ * 实测（2026-09-30）：dsh 的 authorizeIndex 只在
+ *   GET + path 恰为 "/" + token 参数**恰好一个** + token 匹配本次启动的 token
+ * 时才发 303 并下发会话 cookie；否则一律 401 并回
+ *   "dsh web authentication required; reopen the URL printed by dsh web."
+ * 而 token **每次重启 dsh 都会换**，所以从聊天记录/旧卡片里复制来的地址必然踩这一条。
+ */
+function staleTokenPage(hadToken) {
+	const title = hadToken ? "此地址已过期" : "这个地址缺少 token";
+	const detail = hadToken
+		? "地址里的 token 属于**上一次启动**。dsh 每次重启都会更换 token，所以旧地址一定会被拒绝（这不是网络或围栏问题）。"
+		: "局域网入口必须带上本次启动的 token（形如 <code>/?token=…</code>）。";
+	return `<!doctype html>
+<html lang="zh"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>dsh 入口 · ${title}</title>
+<style>
+ body{background:#16181d;color:#e6e8ee;font:16px/1.7 system-ui,-apple-system,"Segoe UI","Noto Sans SC",sans-serif;margin:0;padding:28px;display:flex;justify-content:center}
+ .box{max-width:560px;width:100%}
+ h1{font-size:20px;margin:0 0 12px}
+ .tag{display:inline-block;padding:2px 8px;border-radius:6px;background:#3a2226;color:#ff9aa2;font-size:13px;margin-bottom:14px}
+ ul{padding-left:22px} li{margin:6px 0}
+ code{background:#22262e;padding:2px 6px;border-radius:5px;font-size:14px}
+ .hint{margin-top:18px;padding:12px 14px;border-radius:9px;background:#1d2a22;border:1px solid #2c4a37}
+ a{color:#7ab7ff}
+</style></head>
+<body><div class="box">
+<div class="tag">HTTP 401 · 未通过认证</div>
+<h1>${title}</h1>
+<p>${detail}</p>
+<div class="hint">
+ <strong>怎么拿到能用的地址：</strong>
+ <ul>
+  <li>看手机<strong>负一屏</strong>里最新的那张「DeepSeek Harness本次启动地址」卡片 —— 卡片底部会写<strong>生成时间</strong>与 <code>token 尾 6 位</code>，用最新的那张；</li>
+  <li>或者让电脑上重新推一张：删除旧卡片后等 30 秒（看门狗会自动补发），或直接重启一次 dsh；</li>
+  <li>Tailscale 与阿里云两个入口<strong>不需要 token</strong>（只输密码），token 过期时它们照常可用。</li>
+ </ul>
+</div>
+<p style="opacity:.7;font-size:13px;margin-top:16px">这条提示由本机入口代理生成（<code>dsh-entry-proxy.mjs</code>），用来替代 dsh 原本那句 “reopen the URL printed by dsh web”。</p>
+</div></body></html>`;
+}
+
 /** 去掉逐跳首部；Host / Origin / Cookie 一律原样透传。 */
 function copyHeaders(headers) {
 	const out = {};
@@ -127,6 +170,56 @@ function copyHeaders(headers) {
 		if (v !== undefined) out[key] = v;
 	}
 	return out;
+}
+
+/**
+ * "从别的 App 点开链接" 的兼容垫片 —— 2026-09-30 用户实测报障的根因。
+ *
+ * 症状：手机上从负一屏卡片点开 `http://<lan>:3081/?token=…`，浏览器显示
+ *   "dsh web authentication required; reopen the URL printed by dsh web."
+ * 而同样的地址**手敲进地址栏**或**刷新一下**就正常 —— 我用 curl 验证也一直是好的。
+ *
+ * 根因：dsh 下发的会话 cookie 是 `SameSite=Strict`（dsh-client-connection 的
+ * sessionCookie()）。从**另一个 App**（负一屏卡片）点开属于**跨站导航**：
+ * 浏览器会把 Set-Cookie 存下来，但**在这次跨站导航链里不带它** → 紧跟的 `/`
+ * 请求没有会话 → 401 → 那句提示。手敲地址或刷新属于**同站导航**，所以一直好。
+ *
+ * 垫片做法（不动 dsh、不放松 Strict）：带 token 的浏览器导航先在这里回一个极小的
+ * 中转页，由它**同站**再跳一次；第二次请求就是同站导航，dsh 正常下发 cookie，
+ * 浏览器也会在跳转链里带上它。
+ *
+ * 只拦"浏览器 + 带 token + 还没打过标记"的 GET；curl/脚本（无浏览器 UA）不受影响，
+ * 仍拿到 dsh 原始的 303，现有验证脚本照旧。
+ */
+const BROWSER_UA = /Mozilla|AppleWebKit|Chrome|Chromium|Safari|Edg|Firefox|HuaweiBrowser|MicroMessenger|HeyTapBrowser/i;
+
+function maybeServeHandoff(req, res) {
+	if (req.method !== "GET") return false;
+	const ua = String(req.headers["user-agent"] ?? "");
+	if (!BROWSER_UA.test(ua)) return false;
+	let url;
+	try {
+		url = new URL(req.url, "http://entry.invalid");
+	} catch {
+		return false;
+	}
+	if (!url.searchParams.has("token")) return false;
+	if (url.searchParams.has("hs")) return false;
+
+	url.searchParams.set("hs", "1");
+	const next = `${url.pathname}?${url.searchParams.toString()}`;
+	const body = `<!doctype html>
+<html lang="zh"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>dsh 入口</title><style>body{background:#16181d;color:#e6e8ee;font:16px/1.6 system-ui,-apple-system,"Segoe UI",sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0}a{color:#7ab7ff}</style>
+</head><body><div>正在进入 dsh…<br><a href="${next}">如果没有自动跳转，点这里</a></div>
+<script>location.replace(${JSON.stringify(next)});</script></body></html>`;
+	res.writeHead(200, {
+		"content-type": "text/html; charset=utf-8",
+		"cache-control": "no-store",
+		"content-length": String(Buffer.byteLength(body))
+	});
+	res.end(body);
+	return true;
 }
 
 /** HTTP 转发。 */
@@ -142,9 +235,40 @@ function handleRequest(req, res) {
 		return;
 	}
 
+	if (maybeServeHandoff(req, res)) return;
+
 	const proxyReq = http.request(
 		{ protocol: TARGET.protocol, hostname: TARGET.hostname, port: TARGET.port, method: req.method, path: req.url, headers: copyHeaders(req.headers) },
 		(proxyRes) => {
+			// dsh 对"token 过期/缺失"只回一句含糊的 401 文本。用户复制的是**旧消息里的地址**
+			// （每次重启 dsh 都会换 token），看到那句话根本不知道该做什么。这里把**正文**换成
+			// 一张说明页：状态码仍是 401、不掩盖失败，但告诉用户去哪里拿最新地址。
+			if (proxyRes.statusCode === 401 && req.method === "GET" && req.url.startsWith("/")) {
+				const chunks = [];
+				proxyRes.on("data", (c) => chunks.push(c));
+				proxyRes.on("end", () => {
+					const text = Buffer.concat(chunks).toString("utf8");
+					if (!/authentication required/.test(text)) {
+						res.writeHead(401, proxyRes.headers);
+						res.end(text);
+						return;
+					}
+					let hadToken = false;
+					try {
+						hadToken = new URL(req.url, "http://x").searchParams.has("token");
+					} catch {
+						hadToken = false;
+					}
+					const body = staleTokenPage(hadToken);
+					res.writeHead(401, {
+						"content-type": "text/html; charset=utf-8",
+						"cache-control": "no-store",
+						"content-length": String(Buffer.byteLength(body))
+					});
+					res.end(body);
+				});
+				return;
+			}
 			res.writeHead(proxyRes.statusCode ?? 502, proxyRes.headers);
 			proxyRes.pipe(res);
 		}
