@@ -113,10 +113,33 @@ function post(payload, pinnedIp = "") {
 	});
 }
 
+/**
+ * 卡片来源 / AI 工具名与插件同源：读同一份 profile 配置里 token-broadcast 条目的 source。
+ *
+ * 为什么必须读配置而不是写死：告警卡片是**独立进程**发的（dsh 不在线时也要能发），
+ * 如果这里写死 OpenClaw，配置里改了来源名之后告警卡片仍然是旧名字。
+ * 2026-10-13 就是这么踩的：任务卡片显示配置的来源名，而"补发/告警"这类外部通道的卡片一直显示 OpenClaw。
+ * 读不到时退回 OpenClaw —— 与插件的默认值保持一致。
+ */
+function resolveSource() {
+	try {
+		const yml = readFileSync(join(homedir(), ".dsh", "profiles", "web", "cordis.patch.yml"), "utf8");
+		const block = (yml.match(/id:\s*token-broadcast[\s\S]*?(?=\n#|\n-|$)/) ?? [])[0] ?? "";
+		const match = block.match(/^\s*source:\s*['"]?([^'"\r\n#]+)/m);
+		if (match) return match[1].trim();
+	} catch {
+		// 读不到就当作没配置
+	}
+	return "OpenClaw";
+}
+
 const authCode = resolveAuthCode();
+/** --source 可显式覆盖；不传则读配置（与插件同源）。 */
+const source = arg("source", "") || resolveSource();
+const dry = argv.includes("--dry");
 const reply = (obj) => {
 	process.stdout.write(`${JSON.stringify(obj)}\n`);
-	process.exit(obj.ok ? 0 : 1);
+	process.exit(obj.ok || dry ? 0 : 1);
 };
 
 if (!authCode) reply({ ok: false, status: 0, body: "找不到 authCode（~/.dsh/profiles/web/cordis.patch.yml）" });
@@ -133,11 +156,13 @@ const payload = {
 			summary: finalName,
 			result: finalResult,
 			content: finalContent,
-			source: "OpenClaw",
+			source,
 			taskFinishTime: sec
 		}]
 	}
 };
+
+if (dry) reply({ ok: true, status: 0, body: `dry-run：name=${finalName} / result=${finalResult} / scheduleId=${scheduleId} / source=${source}` });
 
 /**
  * 第二条传输：fetch（undici）。为什么两条都要：2026-10-02 晚上同一个端点出现
